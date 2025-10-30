@@ -731,7 +731,7 @@ dag = DAG(
             "knowledge_id": Param(
                 "74d89a4c-71e7-43b1-9bf6-43960ddbbd80",
                 type="string",
-                description="Knowledge base ID in OpenWebUI",
+                description="Knowledge base ID inOpenWebUI (e.g., 74d89a4c-71e7-43b1-9bf6-43960ddbbd80)",
             ),
             
             # Connection Settings
@@ -768,6 +768,7 @@ dag = DAG(
         }
     ),
     render_template_as_native_obj=True,
+    access_control={"All": {"DAGs": {"can_read", "can_edit", "can_delete"}}},
 )
 
 # Task 1: HR → Staging (Conditional)
