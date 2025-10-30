@@ -16,8 +16,7 @@ import botocore.exceptions
 from datetime import datetime, timedelta
 from pathlib import Path
 from airflow import DAG
-from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.operators.empty import EmptyOperator
+from airflow.operators.python import PythonOperator
 from airflow.models.param import Param, ParamsDict
 from airflow.models import Variable
 
@@ -26,8 +25,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 # Use Airflow Variables for tracking
-STAGING_FILES_VAR = "staging_bucket_files"
-OPENWEBUI_FILES_VAR = "openwebui_knowledge_files"
+STAGING_TRACKING_VAR = "staging_to_openwebui_tracking"
 
 # Default arguments for the DAG
 default_args = {
@@ -46,22 +44,25 @@ default_args = {
 # FILE TRACKING FUNCTIONS
 # ============================================================================
 
-def get_tracked_files(var_name: str) -> dict:
-    """Get tracked files from Airflow Variables."""
+def get_tracking_state():
+    """Get the current tracking state with staging files mapped to OpenWebUI file IDs."""
     try:
-        tracked = Variable.get(var_name, default_var={}, deserialize_json=True)
-        return tracked if isinstance(tracked, dict) else {}
+        tracking = Variable.get(STAGING_TRACKING_VAR, default_var={}, deserialize_json=True)
+        if not isinstance(tracking, dict):
+            return {}
+        # Structure: {staging_file_key: {etag, openwebui_file_id, filename, synced_at}}
+        return tracking
     except:
         return {}
 
 
-def update_tracked_files(var_name: str, files: dict):
-    """Update tracked files in Airflow Variables."""
+def update_tracking_state(tracking: dict):
+    """Update the tracking state."""
     try:
-        Variable.set(var_name, files, serialize_json=True)
-        logger.info(f"✅ Updated tracking for {var_name}: {len(files)} files")
+        Variable.set(STAGING_TRACKING_VAR, tracking, serialize_json=True)
+        logger.info(f"✅ Updated tracking: {len(tracking)} files tracked")
     except Exception as e:
-        logger.error(f"❌ Error updating tracked files: {e}")
+        logger.error(f"❌ Error updating tracking: {e}")
 
 
 # ============================================================================
@@ -116,7 +117,8 @@ def scan_minio_bucket(client, bucket: str) -> dict:
                 'etag': etag,
                 'size': obj['Size'],
                 'size_mb': size_mb,
-                'last_modified': obj['LastModified'].isoformat()
+                'last_modified': obj['LastModified'].isoformat(),
+                'filename': os.path.basename(object_key)  # Extract filename
             }
         
         logger.info(f"📊 Scanned {bucket}: found {len(files_dict)} file(s)")
@@ -175,7 +177,7 @@ def download_from_minio(client, object_key: str, bucket: str) -> str:
 
 def get_openwebui_knowledge_files(knowledge_id: str, webui_url: str, 
                                    openwebui_api_key: str, verify_ssl: bool) -> dict:
-    """Get list of files in OpenWebUI knowledge base with their IDs."""
+    """Get list of files in OpenWebUI knowledge base. Returns dict keyed by filename."""
     url = f"{webui_url}/api/v1/knowledge/{knowledge_id}"
     headers = {"Authorization": f"Bearer {openwebui_api_key}"}
     
@@ -193,9 +195,11 @@ def get_openwebui_knowledge_files(knowledge_id: str, webui_url: str,
                 filename = file_info.get('filename') or file_info.get('name', 'unknown')
                 
                 if file_id:
+                    # Key by filename (basename) for easier matching
                     files_dict[filename] = {
                         'file_id': file_id,
-                        'filename': filename
+                        'filename': filename,
+                        'data': file_info
                     }
             
             logger.info(f"📊 OpenWebUI knowledge base has {len(files_dict)} file(s)")
@@ -418,14 +422,14 @@ def sync_hr_to_staging(**context):
 
 def sync_staging_to_openwebui(**context):
     """
-    Task 2: Sync staging to OpenWebUI
-    - ADD: Files in staging but not in OpenWebUI
-    - DELETE: Files in OpenWebUI but not in staging
-    - UPDATE: Files in both but ETag changed
+    Task 2: Intelligent delta sync from staging to OpenWebUI
+    - Only processes files that changed (added, modified, deleted)
+    - Tracks state to avoid re-processing
+    - Efficient: 1 file changed = 1 file processed
     """
     params = context['params']
     
-    logger.info("🚀 Starting Task 2: staging → OpenWebUI sync")
+    logger.info("🚀 Starting Task 2: staging → OpenWebUI sync (INTELLIGENT DELTA)")
     logger.info(f"🌐 WebUI URL: {params['webui_url']}")
     logger.info(f"🧠 Knowledge ID: {params['knowledge_id']}")
     
@@ -444,71 +448,95 @@ def sync_staging_to_openwebui(**context):
     if not s3_client:
         raise ValueError("❌ Failed to initialize S3 client")
     
-    # Scan staging bucket (SOURCE OF TRUTH)
+    # Get current state
     staging_files = scan_minio_bucket(s3_client, params['minio_staging_bucket'])
-    logger.info(f"📊 Staging bucket has {len(staging_files)} file(s)")
-    
-    # Get OpenWebUI knowledge base files
     openwebui_files = get_openwebui_knowledge_files(
         params['knowledge_id'],
         params['webui_url'],
         params['openwebui_api_key'],
         params['verify_ssl']
     )
+    tracking = get_tracking_state()
     
-    # Get tracked state
-    tracked_staging = get_tracked_files(STAGING_FILES_VAR)
-    tracked_openwebui = get_tracked_files(OPENWEBUI_FILES_VAR)
+    logger.info(f"📊 Current state: {len(staging_files)} in staging, {len(openwebui_files)} in OpenWebUI, {len(tracking)} tracked")
     
-    # Calculate operations
+    # Calculate intelligent delta
     to_add = []
-    to_delete = []
     to_update = []
+    to_delete = []
+    unchanged = []
     
-    # Find files to ADD or UPDATE
+    # Process staging files
     for file_key, file_info in staging_files.items():
-        filename = os.path.basename(file_key)
+        filename = file_info['filename']
         
-        if filename not in openwebui_files:
-            # File in staging but not in OpenWebUI - ADD
-            to_add.append({
-                'key': file_key,
-                'filename': filename,
-                'info': file_info
-            })
-            logger.info(f"➕ File to ADD: {file_key}")
-        else:
-            # File in both - check if modified
-            if file_key in tracked_staging:
-                if tracked_staging[file_key].get('etag') != file_info['etag']:
-                    # ETag changed - UPDATE
+        # Check if we've already synced this exact version
+        if file_key in tracking:
+            tracked_info = tracking[file_key]
+            
+            # If ETag matches and file exists in OpenWebUI, it's unchanged
+            if tracked_info.get('etag') == file_info['etag']:
+                if filename in openwebui_files:
+                    unchanged.append(file_key)
+                    logger.debug(f"⏭️ UNCHANGED: {file_key}")
+                    continue
+                else:
+                    # Was synced before but missing from OpenWebUI - re-add
+                    logger.warning(f"⚠️ File {file_key} was synced but missing from OpenWebUI - will re-add")
+            else:
+                # ETag changed - file was modified
+                if filename in openwebui_files:
                     to_update.append({
                         'key': file_key,
                         'filename': filename,
                         'info': file_info,
                         'old_file_id': openwebui_files[filename]['file_id']
                     })
-                    logger.info(f"🔄 File to UPDATE: {file_key}")
-    
-    # Find files to DELETE
-    for filename, file_info in openwebui_files.items():
-        # Check if this file exists in staging
-        file_exists_in_staging = False
-        for staging_key in staging_files.keys():
-            if os.path.basename(staging_key) == filename:
-                file_exists_in_staging = True
-                break
+                    logger.info(f"🔄 MODIFIED: {file_key}")
+                    continue
         
-        if not file_exists_in_staging:
-            # File in OpenWebUI but not in staging - DELETE
+        # New file or not properly tracked
+        if filename not in openwebui_files:
+            to_add.append({
+                'key': file_key,
+                'filename': filename,
+                'info': file_info
+            })
+            logger.info(f"➕ NEW: {file_key}")
+        else:
+            # File exists in OpenWebUI but not tracked properly - check if update needed
+            # For safety, mark as update to ensure consistency
+            to_update.append({
+                'key': file_key,
+                'filename': filename,
+                'info': file_info,
+                'old_file_id': openwebui_files[filename]['file_id']
+            })
+            logger.info(f"🔄 EXISTS BUT UNTRACKED: {file_key} - will verify/update")
+    
+    # Find files to delete (in OpenWebUI but not in staging)
+    staging_filenames = {info['filename'] for info in staging_files.values()}
+    for filename, file_data in openwebui_files.items():
+        if filename not in staging_filenames:
             to_delete.append({
                 'filename': filename,
-                'file_id': file_info['file_id']
+                'file_id': file_data['file_id']
             })
-            logger.info(f"🗑️ File to DELETE: {filename}")
+            logger.info(f"🗑️ TO DELETE: {filename}")
     
-    # Report plan
-    logger.info(f"📋 Sync Plan: {len(to_add)} to add, {len(to_update)} to update, {len(to_delete)} to delete")
+    # Report delta
+    logger.info("=" * 60)
+    logger.info(f"📋 INTELLIGENT DELTA DETECTED:")
+    logger.info(f"   ➕ {len(to_add)} files to ADD")
+    logger.info(f"   🔄 {len(to_update)} files to UPDATE")
+    logger.info(f"   🗑️ {len(to_delete)} files to DELETE")
+    logger.info(f"   ⏭️ {len(unchanged)} files UNCHANGED (skipped)")
+    logger.info("=" * 60)
+    
+    # If nothing to do, exit early
+    if not to_add and not to_update and not to_delete:
+        logger.info("✅ No changes detected - staging and OpenWebUI are in sync!")
+        return
     
     # Execute operations
     added_count = 0
@@ -517,30 +545,25 @@ def sync_staging_to_openwebui(**context):
     failed_count = 0
     
     # Process ADDITIONS
+    logger.info(f"➕ Processing {len(to_add)} additions...")
     for item in to_add:
-        if process_file_addition(item, s3_client, params):
+        result = process_file_addition(item, s3_client, params, tracking)
+        if result:
             added_count += 1
-            # Update tracking
-            tracked_staging[item['key']] = {
-                'etag': item['info']['etag'],
-                'synced_at': datetime.now().isoformat()
-            }
         else:
             failed_count += 1
     
     # Process UPDATES
+    logger.info(f"🔄 Processing {len(to_update)} updates...")
     for item in to_update:
-        if process_file_update(item, s3_client, params):
+        result = process_file_update(item, s3_client, params, tracking)
+        if result:
             updated_count += 1
-            # Update tracking
-            tracked_staging[item['key']] = {
-                'etag': item['info']['etag'],
-                'synced_at': datetime.now().isoformat()
-            }
         else:
             failed_count += 1
     
     # Process DELETIONS
+    logger.info(f"🗑️ Processing {len(to_delete)} deletions...")
     for item in to_delete:
         if remove_file_from_knowledge(
             params['knowledge_id'],
@@ -551,25 +574,31 @@ def sync_staging_to_openwebui(**context):
         ):
             deleted_count += 1
             # Remove from tracking
-            for key in list(tracked_staging.keys()):
-                if os.path.basename(key) == item['filename']:
-                    del tracked_staging[key]
+            keys_to_remove = [k for k, v in tracking.items() if v.get('filename') == item['filename']]
+            for key in keys_to_remove:
+                del tracking[key]
         else:
             failed_count += 1
     
-    # Update tracked state
-    update_tracked_files(STAGING_FILES_VAR, tracked_staging)
+    # Update tracking state
+    update_tracking_state(tracking)
     
     # Final summary
     logger.info("=" * 60)
-    logger.info(f"✅ Task 2 Complete: staging → OpenWebUI sync finished")
-    logger.info(f"📊 Results: {added_count} added, {updated_count} updated, {deleted_count} deleted, {failed_count} failed")
+    logger.info(f"✅ Task 2 Complete: Intelligent delta sync finished")
+    logger.info(f"📊 Results:")
+    logger.info(f"   ✅ {added_count} added")
+    logger.info(f"   ✅ {updated_count} updated")
+    logger.info(f"   ✅ {deleted_count} deleted")
+    logger.info(f"   ⏭️ {len(unchanged)} skipped (unchanged)")
+    logger.info(f"   ❌ {failed_count} failed")
     logger.info("=" * 60)
 
 
-def process_file_addition(item: dict, s3_client, params) -> bool:
-    """Process adding a new file to OpenWebUI."""
+def process_file_addition(item: dict, s3_client, params, tracking: dict) -> bool:
+    """Process adding a new file to OpenWebUI and update tracking."""
     object_key = item['key']
+    filename = item['filename']
     file_info = item['info']
     
     try:
@@ -607,18 +636,40 @@ def process_file_addition(item: dict, s3_client, params) -> bool:
             params['max_poll_interval']
         ):
             # Add to knowledge base
-            if add_file_to_knowledge(
+            result = add_file_to_knowledge(
                 params['knowledge_id'],
                 file_id,
                 params['webui_url'],
                 params['openwebui_api_key'],
                 params['verify_ssl']
-            ):
-                logger.info(f"✅ Successfully added: {object_key}")
+            )
+            
+            if result:
+                # Update tracking
+                tracking[object_key] = {
+                    'etag': file_info['etag'],
+                    'openwebui_file_id': file_id,
+                    'filename': filename,
+                    'synced_at': datetime.now().isoformat()
+                }
+                logger.info(f"✅ Successfully added and tracked: {object_key}")
                 cleanup_temp_file(temp_file_path)
                 return True
+            else:
+                # Check if it's a duplicate error (already exists)
+                logger.warning(f"⚠️ Could not add {object_key} - might already exist in KB")
+                # Still track it to avoid re-processing
+                tracking[object_key] = {
+                    'etag': file_info['etag'],
+                    'openwebui_file_id': file_id,
+                    'filename': filename,
+                    'synced_at': datetime.now().isoformat(),
+                    'note': 'upload_succeeded_kb_add_failed'
+                }
+                cleanup_temp_file(temp_file_path)
+                return False
         
-        logger.error(f"❌ Failed to add {object_key} to knowledge base")
+        logger.error(f"❌ File {object_key} processing timed out")
         cleanup_temp_file(temp_file_path)
         return False
         
@@ -627,10 +678,12 @@ def process_file_addition(item: dict, s3_client, params) -> bool:
         return False
 
 
-def process_file_update(item: dict, s3_client, params) -> bool:
+def process_file_update(item: dict, s3_client, params, tracking: dict) -> bool:
     """Process updating an existing file in OpenWebUI."""
     object_key = item['key']
+    filename = item['filename']
     old_file_id = item['old_file_id']
+    file_info = item['info']
     
     try:
         logger.info(f"🔄 Updating file: {object_key}")
@@ -643,10 +696,10 @@ def process_file_update(item: dict, s3_client, params) -> bool:
             params['openwebui_api_key'],
             params['verify_ssl']
         ):
-            logger.warning(f"⚠️ Could not remove old version of {object_key}")
+            logger.warning(f"⚠️ Could not remove old version of {object_key} - will try to add new version anyway")
         
         # Add new version (same as addition process)
-        return process_file_addition(item, s3_client, params)
+        return process_file_addition(item, s3_client, params, tracking)
         
     except Exception as e:
         logger.error(f"❌ Error updating file {object_key}: {e}")
@@ -672,10 +725,10 @@ def cleanup_temp_file(temp_file_path: str):
 dag = DAG(
     dag_id='minio_openwebui_knowledge_sync',
     default_args=default_args,
-    description='Three-tier sync: hr-knowledgebase → staging → OpenWebUI',
+    description='Three-tier sync with INTELLIGENT DELTA: hr-knowledgebase → staging → OpenWebUI',
     schedule=None,
     catchup=False,
-    tags=['minio', 'openwebui', 'knowledge-base', 'staging', 'three-tier'],
+    tags=['minio', 'openwebui', 'knowledge-base', 'staging', 'three-tier', 'optimized', 'delta-sync'],
     params=ParamsDict(
         {
             # MinIO Configuration
