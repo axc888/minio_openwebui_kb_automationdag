@@ -208,7 +208,7 @@ def sync_hr_to_staging(**context):
 # ============================================================================
 
 dag = DAG(
-    dag_id='hr_to_staging_sync',
+    dag_id='knowledgebase_to_staging_sync',
     default_args=default_args,
     description='Copy new/modified files from hr-knowledgebase to staging',
     schedule=None,
@@ -260,5 +260,6 @@ sync_task = PythonOperator(
     provide_context=True,
     dag=dag,
 )
+
 
 sync_task
